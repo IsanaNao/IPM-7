@@ -184,7 +184,7 @@ CREATE TRIGGER suppressions_touch_updated_at BEFORE UPDATE ON m3.suppressions
 -- 5. risk_assessments: nachrechenbarer Risiko-Score
 --    Historie bleibt erhalten, genau eine Zeile je Treffer ist aktuell.
 --    Neue Bewertung = neue Zeile = neue id (M4 benachrichtigt je id genau einmal).
---    Massnahme und Frist regelbasiert aus m3_risk/config/risk_policy.yaml.
+--    Massnahme und Frist regelbasiert aus m3_risk/app/risk_policy.yaml.
 -- =====================================================================
 CREATE TABLE m3.risk_assessments (
     id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -262,8 +262,8 @@ CREATE TABLE m3.processing (
     raw_item_id       bigint      PRIMARY KEY REFERENCES public.raw_items (id),
     status            text        NOT NULL CHECK (status IN ('done', 'no_match', 'skipped', 'failed')),
     category          text,
-    match_fingerprint text,       -- cve_ids, cve_affected-Werte, M2-Entitaeten, Inventarstand
-    risk_fingerprint  text,       -- CVSS/KEV/EPSS, Trust, Kategorie, Asset-Attribute, policy_version
+    match_fingerprint text,       -- cve_ids, cve_affected (NVD und OSV), M2-Entitaeten inkl. version_text, Inventarstand ohne Kritikalitaet
+    risk_fingerprint  text,       -- CVSS/KEV/EPSS, Trust, Kategorie, Kritikalitaet und Exposition aktiver Assets, policy_version
     attempts          smallint    NOT NULL DEFAULT 0 CHECK (attempts >= 0),
     last_error        text,
     processed_at      timestamptz NOT NULL DEFAULT now(),
@@ -360,7 +360,7 @@ SELECT
     a.is_active,
     a.updated_at,
     (SELECT count(*) FROM m3.sbom_components c
-      WHERE c.asset_id = a.id AND c.is_active) AS active_component_count,
+      WHERE c.asset_id = a.id AND c.is_active AND a.is_active) AS active_component_count,
     (SELECT count(*) FROM m3.findings_current f
       WHERE f.asset_id = a.id)                 AS open_finding_count,
     (SELECT f.risk_level FROM m3.findings_current f

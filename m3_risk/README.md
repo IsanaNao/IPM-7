@@ -3,8 +3,10 @@
 M3 beantwortet für jede Meldung die Frage: **Betrifft das unser Unternehmen?**
 Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehandelt werden?
 
-> **Stand (PR 1):** Datenbankschema (`db/init/m3_initial.sql`) und diese Schnittstellenbeschreibung.
-> Die Logik (Import, Abgleich, Risiko-Score) folgt in PR 2. Bis dahin gibt es nur `GET /health`.
+> **Stand:** Datenbankschema, Schnittstelle und Kernlogik sind umgesetzt:
+> Inventar-Import (CSV), Abgleich über CVE und NVD-CPE (Wege 1 und 3), Risiko-Score, Belege, `/run`.
+> **Folgt:** SBOM-Import und purl-Abgleich (Weg 2), Abgleich ohne CVE (Wege 4 und 5), Fehlalarme,
+> Empfehlungstexte per lokalem LLM. Diese Endpunkte antworten bis dahin mit `501`.
 > Feedback zur Schnittstelle bitte direkt im PR, vor allem zu den Views für M4 (Abschnitt 5).
 
 ---
@@ -23,7 +25,7 @@ Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehande
 **Regeln**
 - M3 schreibt nur in das Schema `m3`. Tabellen von M1 (`public`) und M2 (`m2`) werden nur gelesen.
 - Einziger Fremdschlüssel nach außen: `public.raw_items(id)`. Kein Verweis auf `cve_affected.id`.
-- Interne Inventardaten verlassen das System nie (siehe Abschnitt 9).
+- Interne Inventardaten verlassen das System nie (siehe Abschnitt 10).
 
 ## 2. Eingaben
 
@@ -35,6 +37,8 @@ Welche Systeme sind betroffen, wie hoch ist das Risiko und bis wann muss gehande
 | `cve_affected` | `data_source`, `cpe`, `vendor`, `product`, `ecosystem`, `package_name`, `version_exact`, `version_start/end_including/excluding` | **Hauptgrundlage für den Abgleich** |
 
 Versionen sind Text. Der Versionsvergleich passiert in M3 (Python). Nicht auswertbare Versionen gelten als `unknown`, **nie** als „nicht betroffen“.
+Mehrere Zeilen je CVE und Produkt sind Alternativen (z. B. je Versionszweig): eine betroffene Zeile reicht.
+Hat eine Zeile sowohl `version_exact` als auch Grenzen und widersprechen sich beide, gilt `unknown` (manuell prüfen).
 
 ### Von M2 (`m2`)
 | Tabelle | Genutzte Felder | Zweck |
@@ -45,13 +49,16 @@ Versionen sind Text. Der Versionsvergleich passiert in M3 (Python). Nicht auswer
 
 ### Wann ist eine Meldung offen?
 Eine Meldung ist für M3 offen, wenn sie in `m2.summaries` steht **und** in `m3.processing`
-noch keine Zeile hat **oder** sich ein Fingerabdruck geändert hat (Abschnitt 8).
+noch keine Zeile hat **oder** sich ein Fingerabdruck geändert hat (Abschnitt 9).
 
 ## 3. Verarbeitung nach Kategorie (aus M2)
 
-| Kategorie | Abgleich in M3 |
+**Meldungen mit CVE werden immer über die CVE abgeglichen**, egal welche Kategorie M2 vergeben hat:
+die CVE ist ein harter Fakt, die Kategorie eine KI-Einschätzung. Die Kategorie steuert nur Meldungen **ohne** CVE.
+
+| Kategorie (Meldung ohne CVE) | Abgleich in M3 |
 |---|---|
-| `VULNERABILITY`, `ATTACK` | Über CVE, Produkt und Version (Wege 1-4) |
+| `VULNERABILITY`, `ATTACK` | Über den Produktnamen (Weg 4) |
 | `REGULATION`, `GEOPOLITICS` | Über den Hersteller (`vendor_exposure`, Weg 5), z. B. Einschränkungen für einen Anbieter. Keine Version, Risiko höchstens `medium`, immer manuell prüfen |
 | `OUTAGE`, `OTHER` | `skipped` (im Prototyp nicht abgeglichen) |
 
@@ -142,11 +149,15 @@ Datei als `multipart/form-data`, UTF-8, Komma als Trennzeichen, Kopfzeile Pflich
 | `environment` | nein | `production` (Standard), `staging`, `test` |
 | `owner_team` | nein | zuständiges Team |
 | `vendor` | nein | Hersteller, z. B. `Fortinet` |
-| `product` | ja | Produkt, z. B. `FortiOS` |
+| `product` | ja | Produkt, z. B. `FortiOS`. Darf leer sein, wenn `cpe23` gesetzt ist |
 | `version` | nein | z. B. `7.2.4` |
-| `component_type` | nein | `application` (Standard), `operating_system`, `firmware`, `library`, `ai_model`, `cloud_service`, `other` |
+| `component_type` | nein | `application` (Standard), `operating_system`, `firmware`, `library`, `container_image`, `ai_model`, `cloud_service`, `other` |
 | `vendor_country` | nein | ISO-Ländercode, z. B. `US`, `DE` (für den Herstellerabgleich) |
 | `cpe23` | nein | z. B. `cpe:2.3:o:fortinet:fortios:7.2.4:*:*:*:*:*:*:*`; wenn gesetzt, gelten Hersteller und Produkt aus der CPE |
+
+Hersteller und Produkt werden wie in NVD-CPEs geschrieben (klein, Unterstrich statt Leerzeichen, ohne Rechtsform;
+bekannte Abweichungen wie „Apache Software Foundation“ -> `apache` stehen in `app/normalize.py`).
+**Am genauesten ist `cpe23`.** Ist sie gesetzt und `product` oder `vendor` leer, kommen Anzeigename und Hersteller aus der CPE. Ohne Produktspalte und ohne gültige CPE ist die Zeile ungültig (422). Die Datei darf auch Semikolon als Trennzeichen haben (deutsches Excel).
 
 Regeln:
 1. Zeilen mit gleichem `asset_key` müssen dieselben Asset-Angaben haben (Name, Typ, Kritikalität, ...).
@@ -168,7 +179,8 @@ Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion n
 
 ## 7. Authentifizierung und Fehler
 
-- Header `X-API-Key` muss `INTERNAL_API_KEY` aus `.env` entsprechen (wie bei M2). Ist kein Key konfiguriert,
+- Header `X-API-Key` muss `INTERNAL_API_KEY` entsprechen (wie bei M2). Ohne `.env` gilt derselbe
+  Entwicklungs-Standard wie bei M2 und n8n (`dev-internal-key`); wird der Key ausdrücklich leer gesetzt,
   wird **jede** Anfrage abgelehnt. Vergleich mit `hmac.compare_digest`.
 - Fehler immer als JSON `{"detail": "..."}` (FastAPI-Standard, wie bei M2).
 
@@ -177,24 +189,48 @@ Body: `{"component_id": 17, "match_key": "CVE-2024-21762", "reason": "Funktion n
 | 200 | Erfolg |
 | 401 | `X-API-Key` fehlt oder ist falsch |
 | 404 | `asset_key` (SBOM) oder `component_id` (Fehlalarm) existiert nicht |
-| 409 | Ein `/run` läuft bereits (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
+| 409 | Ein `/run` oder Import läuft bereits (Thread-Lock und `pg_try_advisory_lock(42003003)`; M2 nutzt 42002002) |
 | 413 | Datei zu groß (vorläufig 5 MB) |
 | 415 | Falscher Dateityp (kein CSV bzw. kein CycloneDX-JSON) |
 | 422 | Inhalt ungültig; Import zusätzlich mit `"errors": [{"row": 5, "field": "criticality", "message": "..."}]` |
 | 500 | Unerwarteter Fehler: allgemeine Meldung, Details nur im Log, **keine Inventardaten in der Antwort** |
+| 501 | Endpunkt noch nicht umgesetzt (SBOM-Import, Fehlalarme) |
 
-## 8. Neubewertung und Lebenszyklus
+## 8. Risiko-Score
+
+Regeln in `app/risk_policy.yaml` (versioniert, Version steht in jeder Bewertung). Jeder Faktor liefert 0-1:
+
+| Faktor | Punkte | Wert |
+|---|---|---|
+| Schwere | 35 | CVSS / 10 |
+| Ausnutzung | 25 | 1 bei CISA KEV, sonst EPSS |
+| Kritikalität | 15 | (Kritikalität - 1) / 4 |
+| Erreichbarkeit | 10 | 1, wenn aus dem Internet erreichbar |
+| Glaubwürdigkeit | 10 | Trust-Score aus M2 |
+| Treffersicherheit | 5 | `confidence` |
+
+Stufen: ab 80 `critical`, ab 60 `high`, ab 40 `medium`, ab 20 `low`, sonst `info`.
+Mindeststufe `high`, wenn die CVE in KEV steht, das System aus dem Internet erreichbar ist und die Version sicher betroffen ist.
+Frist je Stufe (24 h / 7 / 30 / 90 Tage), nie später als die KEV-Frist.
+Fehlende Werte zählen 0 und stehen in `factor_breakdown.missing`, damit die Oberfläche einen unvollständigen Score kennzeichnen kann.
+
+## 9. Neubewertung und Lebenszyklus
 
 **Fingerabdrücke statt Zeitstempel.** Für jede Meldung speichert `m3.processing` zwei Hashes über die
 tatsächlich genutzten Werte:
 
 | Fingerabdruck | Enthält | Bei Änderung |
 |---|---|---|
-| `match_fingerprint` | CVEs der Meldung, Werte aus `cve_affected`, M2-Entitäten, Inventarstand | neu abgleichen und bewerten |
-| `risk_fingerprint` | CVSS, KEV, EPSS, Trust-Score und -Label, Kategorie, Asset-Kritikalität und -Erreichbarkeit, Policy-Version | nur neu bewerten |
+| `match_fingerprint` | CVEs der Meldung, Werte aus `cve_affected` (NVD und OSV), M2-Entitäten (`normalized_name`, `version_text`), Inventarstand ohne Kritikalität | neu abgleichen und bewerten |
+| `risk_fingerprint` | CVSS, KEV, EPSS, Trust-Score und -Label, Kategorie, Kritikalität und Internet-Erreichbarkeit aller aktiven Assets, Policy-Version | nur offene Treffer neu bewerten |
 
 So werden auch Änderungen erkannt, wenn sich nur Werte ändern (z. B. CVE neu in KEV, neuer Trust-Score),
 und unnötige Neuberechnungen vermieden, wenn sich nur ein Zeitstempel ändert.
+Vor dem Abgleich ist noch nicht bekannt, welches Asset getroffen wird. Deshalb enthält der Risiko-Fingerabdruck
+Kritikalität und Internet-Erreichbarkeit **aller aktiven Assets**. Ändert sich nur dieser Fingerabdruck,
+bleibt der bestehende Treffer stehen und wird neu bewertet. Ein neues Abgleichsverfahren (SBOM, Name, Hersteller)
+muss `MATCH_LOGIC_VERSION` in `app/config.py` erhöhen: OSV-Zeilen und Entitäten stehen schon im Hash,
+der neue Code allein stößt keine Neubewertung an.
 
 **Treffer werden nie gelöscht.** Sie werden mit Grund geschlossen (`resolved_reason`). Jede neue Bewertung ist eine
 neue Zeile in `risk_assessments`; genau eine ist `is_current`. Alle Eingangswerte werden als Schnappschuss
@@ -204,7 +240,7 @@ Beispiel: Firewall wird von 7.2.4 auf 7.2.7 aktualisiert -> CSV neu importiert -
 geändert -> neuer Abgleich ergibt „nicht betroffen“ -> Treffer `resolved` mit `version_not_affected`
 -> verschwindet aus `findings_current`, bleibt in `findings_history`.
 
-## 9. Datenschutz
+## 10. Datenschutz
 
 - Inventar, Software und SBOMs liegen nur in der lokalen Datenbank.
 - M3 ruft **keine externen Dienste** auf. Alle externen Informationen kommen bereits aufbereitet von M1.
@@ -212,7 +248,7 @@ geändert -> neuer Abgleich ergibt „nicht betroffen“ -> Treffer `resolved` m
   Faktenpaket. Maßnahme und Frist berechnet M3 regelbasiert, das LLM formuliert nur.
 - Fehlermeldungen enthalten keine Inventardaten.
 
-## 10. Datenmodell
+## 11. Datenmodell
 
 ```mermaid
 flowchart LR
@@ -232,8 +268,9 @@ Wichtige Regeln stehen als Constraints direkt in der Datenbank, u. a.:
 `vendor_exposure` höchstens `medium`; `resolved` nur mit Zeitpunkt und Grund; je Treffer genau eine aktuelle
 Bewertung; `dependency_path` endet bei der betroffenen Komponente.
 
-## 11. Tests
+## 12. Tests
 
+**Schema** (Constraints und Views, Testdaten werden zurückgerollt):
 ```sh
 docker compose down -v
 docker compose up -d postgres
@@ -243,9 +280,20 @@ PowerShell:
 ```powershell
 Get-Content -Raw m3_risk\tests\m3_schema_smoke.sql | docker compose exec -T postgres psql -U argos -d argos -v ON_ERROR_STOP=1
 ```
-Erwartet: `NOTICE:  M3 smoke test OK`. Alle Testdaten werden zurückgerollt.
+Erwartet: `NOTICE:  M3 smoke test OK`.
 
-## 12. Offene Punkte
+**Logik** (im Ordner `m3_risk`, Python 3.12):
+```sh
+pip install -r requirements-dev.txt
+python -m pytest tests                      # Unit-Tests, ohne Datenbank
+M3_TEST_DATABASE_URL=postgresql://argos:argos@localhost:5432/argos python -m pytest tests   # zusätzlich Durchlauf mit DB
+```
+Der Durchlauf mit DB nutzt synthetische Daten (`CVE-2099-*`, `example.invalid`) und **leert alle Tabellen in `m3`**:
+nur gegen die lokale Entwicklungsdatenbank laufen lassen. Geprüft werden u. a.: Import und Fehlerliste,
+Treffer und Nicht-Treffer nach Version, Neubewertung bei KEV-Änderung (neue `risk_assessment_id`),
+Update schließt Treffer (`version_not_affected`), Downgrade öffnet ihn wieder, deaktiviertes Asset, 401 und 409.
+
+## 13. Offene Punkte
 
 | An | Frage / Hinweis |
 |---|---|
